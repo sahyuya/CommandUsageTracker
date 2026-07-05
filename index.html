@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minecraft コマンド使用率アナライザー</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.6; padding: 20px; max-width: 900px; margin: 0 auto; color: #333; }
+        .card { background: #fdfdfd; border: 1px solid #ddd; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .control-group { margin-bottom: 15px; }
+        label { display: block; font-weight: bold; margin-bottom: 5px; }
+        input[type="file"], select, input[type="text"], button { width: 100%; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
+        button { background-color: #2ea44f; color: white; border: none; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        button:hover { background-color: #2c974b; }
+        #targetCommandContainer { display: none; }
+        
+        /* 進捗バーのスタイル */
+        #progressContainer { display: none; margin-top: 20px; padding: 15px; background: #e1f5fe; border-radius: 4px; text-align: center; border: 1px solid #b3e5fc; }
+        progress { width: 100%; height: 20px; margin-top: 10px; }
+        
+        /* ツリー表示のスタイル */
+        .tree-container { margin-top: 20px; background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px; overflow-x: auto; }
+        ul { list-style-type: none; padding-left: 20px; margin: 0; }
+        .tree-root > ul { padding-left: 0; }
+        details { margin: 2px 0; }
+        summary { cursor: pointer; padding: 6px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        summary:hover { background-color: #f1f8ff; }
+        .node-name { font-weight: bold; color: #0366d6; }
+        .stats { font-family: monospace; color: #555; background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-size: 14px; white-space: nowrap;}
+        .leaf-node { padding: 6px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed #eee; margin-left: 15px; }
+        
+        /* ランキングテーブルのスタイル */
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        th { background-color: #f6f8fa; }
+    </style>
+</head>
+<body>
+
+    <h1>Minecraft コマンド使用率アナライザー</h1>
+
+    <div class="card">
+        <div class="control-group">
+            <label for="logFile">サーバーログファイル (.log, .txt)</label>
+            <input type="file" id="logFile" accept=".txt,.log">
+        </div>
+
+        <div class="control-group">
+            <label for="mode">集計モード</label>
+            <select id="mode" onchange="toggleTargetInput()">
+                <option value="all">全コマンドの使用率を見る</option>
+                <option value="specific">特定コマンドの続き(引数)の使用率を調べる</option>
+                <option value="ranking">特定コマンドのプレイヤーランキングを見る</option>
+            </select>
+        </div>
+
+        <div class="control-group" id="targetCommandContainer">
+            <label for="targetCommand">対象のコマンド文字例 (例: /warp)</label>
+            <input type="text" id="targetCommand" placeholder="スペースを含めての指定も可能です">
+        </div>
+
+        <button onclick="startProcessing()">集計開始</button>
+    </div>
+
+    <div id="progressContainer">
+        <strong id="progressStatus">読み込み中...</strong>
+        <span id="progressPercent">0%</span>
+        <progress id="progressBar" value="0" max="100"></progress>
+    </div>
+
+    <div id="resultArea" class="tree-container" style="display:none;"></div>
+
+    <script>
+        function toggleTargetInput() {
+            const mode = document.getElementById('mode').value;
+            const container = document.getElementById('targetCommandContainer');
+            container.style.display = (mode === 'specific' || mode === 'ranking') ? 'block' : 'none';
+        }
+
+        async function startProcessing() {
+            const fileInput = document.getElementById('logFile');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert('ファイルを選択してください。');
+                return;
+            }
+
+            const mode = document.getElementById('mode').value;
+            const targetCmd = document.getElementById('targetCommand').value.trim();
+
+            if ((mode === 'specific' || mode === 'ranking') && !targetCmd) {
+                alert('対象のコマンドを入力してください。');
+                return;
+            }
+
+            // UIリセット
+            document.getElementById('resultArea').style.display = 'none';
+            const progressContainer = document.getElementById('progressContainer');
+            const progressStatus = document.getElementById('progressStatus');
+            const progressBar = document.getElementById('progressBar');
+            const progressPercent = document.getElementById('progressPercent');
+            progressContainer.style.display = 'block';
+
+            // データ格納用変数
+            let commandTree = {};
+            let playerRank = {};
+            let totalProcessedCommands = 0;
+
+            const totalSize = file.size;
+            const chunkSize = 1024 * 1024 * 2; // 2MBごとに分割して読み込む
+            let textLeftover = '';
+
+            progressStatus.innerText = '集計中...';
+
+            // ログの正規表現パターンの考え方の道筋:
+            // "] <プレイヤー名> issued server command: <コマンド>" の形を抽出。
+            // プレイヤー名は英数字とアンダーバーを想定し `[a-zA-Z0-9_]+` と定義。
+            const logRegex = /\]\s+([a-zA-Z0-9_]+)\s+issued server command:\s+(.+)/;
+
+            for (let offset = 0; offset < totalSize; offset += chunkSize) {
+                const chunk = file.slice(offset, offset + chunkSize);
+                const text = await chunk.text();
+                
+                // 前回のチャンクの余り行と結合して行に分割
+                const lines = (textLeftover + text).split('\n');
+                textLeftover = lines.pop(); // 最後の行は途切れている可能性があるので次へ回す
+
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const match = line.match(logRegex);
+                    
+                    if (match) {
+                        const player = match[1];
+                        const fullCmd = match[2].trim();
+                        const parts = fullCmd.split(/\s+/); // 空白で引数を分割
+
+                        if (mode === 'all') {
+                            totalProcessedCommands++;
+                            buildTree(commandTree, parts);
+                        } else if (mode === 'specific') {
+                            if (fullCmd.startsWith(targetCmd)) {
+                                totalProcessedCommands++;
+                                // ターゲットコマンド部分を削り、続きの引数からツリーを構築
+                                const remainingStr = fullCmd.slice(targetCmd.length).trim();
+                                const remainingParts = remainingStr ? remainingStr.split(/\s+/) : ['<引数なし>'];
+                                buildTree(commandTree, remainingParts);
+                            }
+                        } else if (mode === 'ranking') {
+                            if (fullCmd.startsWith(targetCmd)) {
+                                totalProcessedCommands++;
+                                playerRank[player] = (playerRank[player] || 0) + 1;
+                            }
+                        }
+                    }
+                }
+
+                // UIのフリーズを防ぐため、ブラウザに描画の余白を与える＆進捗更新
+                const percent = Math.min(100, Math.round(((offset + chunkSize) / totalSize) * 100));
+                progressBar.value = percent;
+                progressPercent.innerText = `${percent}%`;
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+
+            // 最終余り行の処理
+            if (textLeftover) {
+                const match = textLeftover.match(logRegex);
+                if (match) {
+                    // 同様の処理(簡略化のため省略せず念の為処理)
+                    const fullCmd = match[2].trim();
+                    if (mode === 'all') {
+                        totalProcessedCommands++;
+                        buildTree(commandTree, fullCmd.split(/\s+/));
+                    }
+                }
+            }
+
+            progressStatus.innerText = '描画中...';
+            await new Promise(resolve => setTimeout(resolve, 50)); // 描画前に一呼吸
+
+            // 結果の描画
+            renderResults(mode, commandTree, playerRank, totalProcessedCommands);
+            progressContainer.style.display = 'none';
+        }
+
+        // ツリーデータ構造の構築
+        function buildTree(node, parts) {
+            if (parts.length === 0) return;
+            const part = parts[0];
+            if (!node[part]) node[part] = { count: 0, children: {} };
+            node[part].count++;
+            buildTree(node[part].children, parts.slice(1));
+        }
+
+        // 結果の画面への書き出し
+        function renderResults(mode, commandTree, playerRank, totalCount) {
+            const resultArea = document.getElementById('resultArea');
+            resultArea.style.display = 'block';
+
+            if (totalCount === 0) {
+                resultArea.innerHTML = '<p>条件に一致するコマンドが見つかりませんでした。</p>';
+                return;
+            }
+
+            let html = `<h3>総集計件数: ${totalCount}件</h3>`;
+
+            if (mode === 'all' || mode === 'specific') {
+                html += '<div class="tree-root">' + generateTreeHTML(commandTree, totalCount) + '</div>';
+            } else if (mode === 'ranking') {
+                const sortedRank = Object.entries(playerRank).sort((a, b) => b[1] - a[1]);
+                html += '<table><tr><th>順位</th><th>プレイヤーID</th><th>使用回数</th><th>使用率</th></tr>';
+                sortedRank.forEach(([player, count], index) => {
+                    const rate = ((count / totalCount) * 100).toFixed(2);
+                    html += `<tr><td>${index + 1}</td><td>${player}</td><td>${count}</td><td>${rate}%</td></tr>`;
+                });
+                html += '</table>';
+            }
+
+            resultArea.innerHTML = html;
+        }
+
+        // ツリー構造からHTML(details/summary)を再帰的に生成
+        function generateTreeHTML(node, parentTotalCount) {
+            // 使用回数が多い順にソート
+            const entries = Object.entries(node).sort((a, b) => b[1].count - a[1].count);
+            if (entries.length === 0) return '';
+            
+            let html = '<ul>';
+            for (const [key, val] of entries) {
+                const rate = ((val.count / parentTotalCount) * 100).toFixed(2);
+                const statStr = `${rate}% | ${val.count}回`;
+                const hasChildren = Object.keys(val.children).length > 0;
+
+                if (hasChildren) {
+                    html += `<li>
+                        <details>
+                            <summary>
+                                <span class="node-name">${escapeHTML(key)}</span>
+                                <span class="stats">${statStr}</span>
+                            </summary>
+                            ${generateTreeHTML(val.children, val.count)}
+                        </details>
+                    </li>`;
+                } else {
+                    html += `<li>
+                        <div class="leaf-node">
+                            <span class="node-name">${escapeHTML(key)}</span>
+                            <span class="stats">${statStr}</span>
+                        </div>
+                    </li>`;
+                }
+            }
+            html += '</ul>';
+            return html;
+        }
+
+        // XSS対策のサニタイズ処理
+        function escapeHTML(str) {
+            return str.replace(/[&<>'"]/g, 
+                tag => ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    "'": '&#39;',
+                    '"': '&quot;'
+                }[tag])
+            );
+        }
+    </script>
+</body>
+</html>
