@@ -131,7 +131,7 @@
     dzFilename.hidden = false;
     dzFilename.textContent = `選択中: ${file.name}（${formatBytes(file.size)}）`;
     progressArea.hidden = false;
-    setProgress('loading', 0);
+    setProgress('streaming', 0);
 
     if (currentWorker) currentWorker.terminate();
     currentWorker = new Worker('worker.js');
@@ -160,7 +160,7 @@
   }
 
   function setProgress(phase, percent) {
-    progressPhaseEl.textContent = phase === 'loading' ? '読み込み中...' : '集計中...';
+    progressPhaseEl.textContent = phase === 'streaming' ? 'ストリーミング解析中...' : '処理中...';
     const p = Math.max(0, Math.min(100, percent));
     progressPercentEl.textContent = `${p.toFixed(0)}%`;
     progressBarEl.style.width = `${p}%`;
